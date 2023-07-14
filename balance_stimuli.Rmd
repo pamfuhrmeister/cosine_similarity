@@ -1,0 +1,303 @@
+---
+title: "Balance stimuli"
+author: "Pam Fuhrmeister"
+date: "`r Sys.Date()`"
+output:
+    html_document:
+    keep_md: yes
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+    theme: cosmo
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+# load packages we need
+library(tidyverse)
+library(kableExtra)
+
+# set chunk options to show code in output (echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Balance stimulus lists
+
+This Rmd document shows the steps we took to balance two lists of stimuli for an experiment. In the experiment, participants saw a picture on a computer screen and were asked to simply say the name of the picture out loud. We then measured how long it took participants to name the pictures (response time). We know that certain variables influence response times, such as how frequently the word occurs (frequency), the age at which the speaker learned the word (age of acquisition), and a measure of the number of different possible names that people typically use to describe a given object, for example sofa/couch has two frequently used names (name agreement).
+
+We needed two lists of stimuli (pictures) for participants to name because we had them complete two sessions, and we wanted the pictures to be different for each session but also be as close as possible in terms of the variables that influence speed of naming pictures.
+
+Here is an overview of the procedure:
+
+1. Select pictures from a database with the highest name agreement values (310 total because we want 155 pictures for each list)
+2. Obtain values for frequency, age of acquisition and name agreement for each of these pictures: these values form a feature vector for each picture
+3. z-score the values for these variables to put them on the same scale
+4. Get all possible combinations of pairs of pictures, put in a data frame
+5. Compute the cosine similarity of the feature vectors for each pair of pictures
+6. Sample through one million random lists (lists are pairings of 155 pictures because we want to end up with two lists of 155 pictures) and compute the mean cosine similarity for each list
+7. Choose the list with the highest cosine similarity
+
+## Data wrangling
+
+```{r}
+# read in file with pictures from database (database includes name agreement measures)
+stimuli <- read.csv("English_MultiPic_CSV.csv", header = TRUE, sep = ";")
+
+# column H_INDEX is the column with name agreement values
+# we need to change commas to decimals in the name agreement and the percentage modal name columns (csv was downloaded in Germany where commas are used as the tens separator and decimal points are used as the thousands separator)
+stimuli$H_INDEX <- gsub(",", ".", stimuli$H_INDEX)
+stimuli$H_INDEX <- as.numeric(stimuli$H_INDEX)
+stimuli$PERCENTAGE_MODAL_NAME <- gsub(",", ".", stimuli$PERCENTAGE_MODAL_NAME)
+stimuli$PERCENTAGE_MODAL_NAME <- as.numeric(stimuli$PERCENTAGE_MODAL_NAME)
+
+# here we filter out Picture 214 because it has the same name as another picture, and we want to avoid that
+# we also filter for pictures that have an H_INDEX (name agreement value) of less than .52, which are the 310 pictures in the database with the highest name agreement
+# select columns for the picture ID, the most common name for the picture, and the name agreement values
+stimuli <- stimuli %>%
+  filter(PICTURE != "PICTURE_214") %>%
+  filter(H_INDEX < .52) %>%
+  select(PICTURE, NAME1, H_INDEX)
+
+# rename the column NAME1 to Word, which is more intuitive
+colnames(stimuli)[2] <- "Word"
+
+# arrange data frame in alphabetical order by word, mark any duplicates we didn't catch previously, and filter the data frame so it only includes non-duplicates
+stimuli <- stimuli %>%
+  arrange(Word) %>%
+  mutate(duplicate = ifelse(Word == lag(Word), "Yes", "No")) %>%
+  mutate(duplicate = ifelse(is.na(duplicate) == TRUE, "No", duplicate)) %>%
+  filter(duplicate == "No") %>%
+  select(-duplicate)
+
+# read in data on word frequency
+freq <- read.csv("SUBTLEX-UK.csv", header = TRUE, sep = ";")
+
+# change commas to decimal points for the frequency values
+freq$LogFreq.Zipf. <- gsub(",", ".", freq$LogFreq.Zipf.)
+
+# change frequency column to numeric
+freq$LogFreq.Zipf. <- as.numeric(freq$LogFreq.Zipf.)
+
+# rename columns
+colnames(freq) <- c("Word", "frequency")
+
+# read in age of acquisition data
+aoa <- read.csv("AoA.csv", header = TRUE, sep = ";")
+
+# change commas to decimal points for the frequency values 
+aoa$Rating.Mean <- gsub(",", ".", aoa$Rating.Mean)
+
+# change age of acquisition column to numeric
+aoa$Rating.Mean <- as.numeric(aoa$Rating.Mean)
+
+# rename columns
+colnames(aoa) <- c("Word", "AoA")
+
+# merge the three data frames together
+stimuli_final <- merge(merge(
+  stimuli, 
+  freq,),
+  aoa,
+  by = "Word")
+
+
+```
+
+## Compute cosine similarity and balance lists
+
+```{r results='hide'}
+# z-score the values with the scale function
+stimuli_final[3:5] <- map_df(stimuli_final[3:5], scale)
+
+# create a unique identifier for each word-picture combination
+stimuli_final <- stimuli_final %>%
+  mutate(word_pic = paste(Word, PICTURE, sep = "_"))
+
+# create data frame with all possible unique pairs of the pictures
+pairings <- data.frame(t(combn(stimuli_final$word_pic, 2)))
+
+# rename columns 
+colnames(pairings) <- c("Stim_1", "Stim_2")
+
+# create blank column to store the cosine similarity
+pairings$cosine <- NA
+
+# calculate cosine similarity for all possible pairs of pictures
+for(i in 1:nrow(pairings)){
+  vec0 <- pairings[i,]
+  new <- subset(stimuli_final, word_pic %in% vec0)
+  vec_1 <- as.numeric(new[1,3:5])
+  vec_2 <- as.numeric(new[2,3:5])
+  pairings[i,]$cosine <- lsa::cosine(vec_1, vec_2)
+  print(i)
+}
+
+# create columns with unique identifiers for the word-picture pairs
+pairings <- pairings %>%
+  mutate(pair_id = paste(Stim_1, Stim_2, sep = "_")) %>%
+  mutate(pair_id2 = paste(Stim_1, Stim_2, sep = "_"))
+
+# create character vector of all unique word-picture identifiers
+stim_all <- as.character(stimuli_final$word_pic)
+
+# set seed so results are replicable (we set the seed outside the loop so it doesn't reset to the same number for each sample!)
+set.seed(2)
+
+# create list to save sets in
+sets <- list()
+
+# set a counter to 1
+y <- 1
+
+# we repeat the following process 1 million times
+
+repeat {
+  # first we take a random sample of 155 (indices) pictures from the 310 pictures that we want to balance for the lists
+  samp <- sample(length(stim_all), 155)
+  
+  # we assign the 155 we randomly sampled to an object a
+  a <- stim_all[samp]
+  # the ones left over (the other half) we assign to an object b
+  b <- stim_all[-samp]
+  
+  # combine a and b into a data frame
+  ab <- data.frame(a,b)
+  
+  # we create two columns with unique identifiers for the pairs (a-b and b-a)
+  ab <- ab %>%
+    mutate(pair_id = paste(a, b, sep = "_")) %>%
+    mutate(pair_id2 = paste(b, a, sep = "_"))
+  
+  # in our pairings data frame, we have combinations of each pair of pictures and their cosine similarity but the order in the pairings data frame might be different than we have them stored in the ab data frame (e.g., ambulance_sword or sword_ambulance)
+  # to get the cosine similarity of the pairs in whichever order they're stored, we create two data frames by merging the ab data frame with the pairings data frame by either pair id (a-b order) and pair id (ba-a order)
+  ab_pair <- merge(ab, pairings, by = "pair_id")
+  ab_pair2 <- merge(ab, pairings, by = "pair_id2")
+  
+  # then we keep only the columns with the single word-picture pairings and the cosine similarity because this is all we need
+  ab_all <- bind_rows(ab_pair, ab_pair2) %>%
+    select(a, b, cosine)
+  
+  # then we save this in the list of sets
+  sets <- append(sets, list(ab_all))
+  
+  # here we print our counter to know how many more iterations we have left
+  print(y)
+  
+  # we add one to the counter
+  y = y+1
+  
+  # we stop after the counter has completed the one millionth iteration
+  if (y == 1000001){
+    break
+  }
+}
+
+
+# map over each list to calculate mean of cosine similarity for each list
+mean_cosine_sim <- map(sets, function(x){mean(x$cosine)})
+
+# convert each list to a data frame and create a unique column containing the list id
+mean_cosine_sim_sorted <- map_df(mean_cosine_sim, ~as.data.frame(.x), .id="id")
+
+# rename column with cosine similarity to cosine_sim
+colnames(mean_cosine_sim_sorted)[2] <- "cosine_sim"
+
+# order the lists in descending order (i.e., highest first) so we can extract the list with the highest cosine similarity
+extract_highest <- mean_cosine_sim_sorted %>%
+  arrange(desc(cosine_sim))
+
+# extract the list with the highest cosine similarity
+stimuli_to_use <- sets[[as.numeric(extract_highest[1,1])]]
+
+```
+
+## Extract lists and format table for paper
+
+```{r}
+# do some data wrangling to get a data frame with the words and picture IDs for the two lists we created and cosine similarity for the feature vectors so we can compute the mean and standard deviation to report in the paper
+
+# first we split the strings in the columns a and b by "_" to get one column of the word, then we put the next two columns back together (PICTURE_NR) because this is the file name of the pictures, and we'll need this to program the experiment
+stimuli_to_use <- stimuli_to_use %>%
+  separate(col = a, into = c("List_a", "Picture_a", "Number_a"),
+           sep = "_", remove = TRUE) %>%
+  separate(col = b, into = c("List_b", "Picture_b", "Number_b"),
+           sep = "_", remove = TRUE) %>%
+  mutate(Picture_Num_a = paste(Picture_a, Number_a, sep = "_")) %>%
+  mutate(Picture_Num_b = paste(Picture_b, Number_b, sep = "_")) %>%
+  select(-c(Picture_a, Number_a, Picture_b, Number_b)) # delete columns we don't need
+
+# here we make a new data frame for list a by merging the data frame with the other data frames we made previously that include the values for frequency, age of acquisition and name agreement
+stim_lists_a <- stimuli_to_use # copy data frame
+colnames(stim_lists_a)[4] <- "PICTURE"  # rename a column to merge
+stim_lists_a <- merge(stim_lists_a, stimuli, by = "PICTURE") # merge with stimuli data frame for name agreement values
+
+# merge with frequency and age of acquisition data frames
+stim_lists_a <- merge(merge(
+  stim_lists_a, 
+  freq,),
+  aoa,
+  by = "Word")
+
+# compute the mean of the variables for list a
+list_1_mean <- data.frame(lapply(stim_lists_a[7:9], mean))
+
+# rename columns to make it easier to read
+colnames(list_1_mean) <- c("H-index mean", "Frequency mean", "AoA mean")
+
+# compute standard deviation of the variables in list a
+list_1_sd <- data.frame(lapply(stim_lists_a[7:9], sd))
+
+# rename columns to make it easier to read
+colnames(list_1_sd) <- c("H-index SD", "Frequency SD", "AoA SD")
+
+# combine the data frames into one
+stimuli_paper_table <- cbind(list_1_mean, list_1_sd)
+
+# repeat this procedure for list b: combine with other data frames to get values of frequency, age of acquisition, and name agreement
+stim_lists_b <- stimuli_to_use # copy data frame
+colnames(stim_lists_b)[5] <- "PICTURE"  # rename a column to merge
+stim_lists_b <- merge(stim_lists_b, stimuli, by = "PICTURE") # merge with stimuli data frame for name agreement values
+
+# merge with frequency and age of acquisition data frames
+stim_lists_b <- merge(merge(
+  stim_lists_b, 
+  freq,),
+  aoa, 
+  by = "Word")
+
+# compute the mean of the variables for list b
+list_2_mean <- data.frame(lapply(stim_lists_b[7:9], mean))
+
+# rename columns to make it easier to read
+colnames(list_2_mean) <- c("H-index mean", "Frequency mean", "AoA mean")
+
+# compute standard deviation of variables for list b
+list_2_sd <- data.frame(lapply(stim_lists_b[7:9], sd))
+
+# rename columns to make it easier to read
+colnames(list_2_sd) <- c("H-index SD", "Frequency SD", "AoA SD")
+
+# combine the data frames into one
+stimuli_paper_table_temp <- cbind(list_2_mean, list_2_sd)
+
+# combine data frames with mean and standard deviation of variables for lists a and b
+stimuli_paper_table <- rbind(stimuli_paper_table, stimuli_paper_table_temp)
+
+# rearrange columns so that mean and standard deviation of variables are displayed next to each other
+stimuli_paper_table <- stimuli_paper_table[,c(2,5,3,6,1,4)]
+
+# make a column with list name (changed to 1 and 2 from a and b for the paper)
+stimuli_paper_table <- rowid_to_column(stimuli_paper_table, var = "List")
+
+```
+
+
+## Table of means and standard deviations for variables of both lists
+
+```{r}
+# create table, round to two decimal points
+stimuli_paper_table %>%
+  kbl(digits = 2) %>%
+  kable_styling()
+
+```
